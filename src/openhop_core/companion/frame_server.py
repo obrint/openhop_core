@@ -139,6 +139,33 @@ from .models import Contact, QueuedMessage
 
 logger = logging.getLogger("CompanionFrameServer")
 
+# --- CayenneLPP self-telemetry encoding -------------------------------------
+# Backport of openhop_core dev (protocol/cayenne_lpp.py) onto the 1.1.1 layout.
+# Byte-compatible with MeshCore's vendored CayenneLPP library.
+
+_LPP_VOLTAGE = 0x74  # 116: 2 bytes, 0.01 V/LSB, unsigned (LPPDataHelpers.h)
+_LPP_VOLTAGE_MULT = 100
+_TELEM_CHANNEL_SELF = 1  # LPP data channel for the 'self' device (SensorManager.h:10)
+
+
+def _f32(value: float) -> float:
+    """Round a Python double to IEEE-754 single precision (C ``float``)."""
+    return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
+def _encode_lpp_voltage(channel: int, millivolts: int) -> bytes:
+    """Encode a CayenneLPP voltage entry the way the firmware does.
+
+    Firmware: ``telemetry.addVoltage(TELEM_CHANNEL_SELF, battMilliVolts/1000.0f)``
+    (MyMesh.cpp:1638). CayenneLPP computes ``uint32_t v = value * multiplier``
+    entirely in single-precision float and truncates toward zero, so the float
+    rounding is reproduced here (e.g. 4200 mV -> 4.2f*100 = 419.99998 -> 419)
+    to stay byte-identical. Unknown battery (0 mV) still emits a 0 V entry.
+    Bytes are MSB-first.
+    """
+    v = int(_f32(_f32(millivolts / 1000.0) * _f32(_LPP_VOLTAGE_MULT))) & 0xFFFF
+    return bytes([channel & 0xFF, _LPP_VOLTAGE]) + v.to_bytes(2, "big")
+
 
 def _build_advert_push_frames(contact: Contact) -> tuple[bytes, Optional[bytes]]:
     """Build PUSH_CODE_ADVERT short frame and optional PUSH_CODE_NEW_ADVERT
@@ -379,6 +406,33 @@ class CompanionFrameServer:
     def _get_batt_and_storage(self) -> tuple[int, int, int]:
         """Hook: return (millivolts, used_kb, total_kb).  Default: all zeros."""
         return (0, 0, 0)
+
+    def _get_self_telemetry_lpp(self) -> bytes:
+        """Hook: return local sensor telemetry as CayenneLPP bytes.
+
+        Mirrors the firmware self-telemetry `sensors.querySensors(0xFF, ...)`
+        (MyMesh.cpp:1646) with permission mask 0xFF. Default is no sensor
+        data; the battery-voltage floor is still emitted.
+        """
+        return b""
+
+    def _push_self_telemetry(self) -> None:
+        """Build and synchronously push this node's own telemetry.
+
+        Mirrors the firmware 'self' telemetry request (MyMesh.cpp:1636-1648):
+        seed a CayenneLPP buffer with a battery-voltage entry
+        (`telemetry.addVoltage(TELEM_CHANNEL_SELF, battMilliVolts/1000)`),
+        append any local sensor LPP bytes, and write one push frame
+        `[PUSH_CODE_TELEMETRY_RESPONSE][0x00][self pubkey[0:6]][CayenneLPP]`.
+        The push is always emitted, even with no sensors (voltage-only floor),
+        and is written synchronously in the handler like the firmware.
+        """
+        millivolts = self._get_batt_and_storage()[0]
+        lpp = _encode_lpp_voltage(_TELEM_CHANNEL_SELF, millivolts)
+        lpp += self._get_self_telemetry_lpp()
+        pubkey_prefix = self.bridge.get_public_key()[:6]
+        self._write_frame(bytes([PUSH_CODE_TELEMETRY_RESPONSE, 0]) + pubkey_prefix + lpp)
+        logger.info("Self telemetry push sent to client: %d bytes LPP", len(lpp))
 
     # -------------------------------------------------------------------------
     # Push callbacks
@@ -1532,10 +1586,21 @@ class CompanionFrameServer:
         self._write_frame(bytes([PUSH_CODE_STATUS_RESPONSE, 0]) + pubkey[:6] + raw_bytes)
 
     async def _cmd_send_telemetry_req(self, data: bytes) -> None:
-        # Protocol: CMD_SEND_TELEMETRY_REQ has reserved bytes(3) then pub_key bytes(32).
-        # See MeshCore Companion-Radio-Protocol: CMD_SEND_TELEMETRY_REQ frame format.
+        # Firmware CMD_SEND_TELEMETRY_REQ has two forms, split by frame length
+        # (MyMesh.cpp:1616-1648). Frame length includes the command byte;
+        # `data` here is cmd-byte-stripped, so subtract one from each guard:
+        #   - remote/contact form: firmware `len >= 4 + PUB_KEY_SIZE` -> data >= 35
+        #     (3 reserved bytes then a 32-byte pub key).
+        #   - self form: firmware `len == 4` -> data == 3 (3 reserved bytes, no
+        #     key). Firmware builds local telemetry synchronously and pushes it.
+        # Anything else falls through to the unsupported-command error.
+        #
+        # Backport of openhop_core dev commit 3513bab onto the 1.1.1 layout.
+        if len(data) == 3:
+            self._push_self_telemetry()
+            return
         if len(data) < 35:
-            self._write_err(ERR_CODE_ILLEGAL_ARG)
+            self._write_err(ERR_CODE_UNSUPPORTED_CMD)
             return
         pubkey = data[3:35]
         flags = 0x07  # request all: base + location + environment
